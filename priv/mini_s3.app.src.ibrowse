@@ -30,7 +30,7 @@
                   public_key,
                   sasl,
                   ssl,
-                  lhttpc,
+                  ibrowse,
                   stdlib,
                   xmerl
                  ]},

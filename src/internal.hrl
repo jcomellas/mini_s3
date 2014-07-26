@@ -21,9 +21,15 @@
 -record(config, {
           s3_url = "http://s3.amazonaws.com"  :: string(),
           credentials_store                   :: iam | baked_in,
-          access_key_id                       :: string(),
-          secret_access_key                   :: string(),
+          access_key_id                       :: binary(),
+          secret_access_key                   :: binary(),
           bucket_access_type = virtual_hosted :: mini_s3:bucket_access_type()
 }).
 
--define(AMAZON_METADATA_SERVICE_URI, "http://169.254.169.254/latest/meta-data/").
+% metadata service is only used from within an instance.
+-define(AMAZON_METADATA_SERVICE,"http://169.254.169.254/latest/meta-data/").
+
+-define(DEFAULT_CHUNK_SIZE, 64*1024). % 64kb chunks for streaming
+-define(DEFAULT_HTTP_TIMEOUT, 5000). % 5 seconds
+-define(XMLNS_S3, "http://s3.amazonaws.com/doc/2006-03-01/").
+

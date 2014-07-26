@@ -2,8 +2,8 @@
 deps
 *.tmproj
 _build
-*.plt
+*_plt
 ebin/*.beam
 ebin/*.app
 .eunit
-/.concrete/DEV_MODE
+test/fake_s3_SUITE_data/
