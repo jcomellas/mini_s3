@@ -22,30 +22,24 @@ start() ->
                        | {stream_from, {filename(), chunk_size_bytes()}},
                Opts   :: mini_s3:httpc_opts()) ->  
     mini_s3:response() | {error, any()}.
-send_req(URI, Method, Hdrs, {stream_from, {Filename, ChunkSize}}, Opts) ->
-    {Timeout, Opts1} = get_timeout(Opts),
+send_req(URI, put, Hdrs, {stream_from, {Filename, ChunkSize}}, Opts) ->
+    Hdrs1 = maybe_add_content_length(Hdrs, Filename),
+    Opts1 = maybe_add_flow_control(Opts),
+    {Timeout, Opts2} = get_timeout(Opts1),
     {ok, File} = file:open(Filename, [read, binary, raw]),
-    case file:read(File, ChunkSize) of
-        {ok, Data} ->
-            {ok, State} = lhttpc:request(URI,
-                                          Method,
-                                          Hdrs,
-                                          Data,
-                                          Timeout,
-                                          [{partial_upload, infinity}]++Opts1),
-            stream_file(File, ChunkSize, {ok, Data}, State);
-        eof ->
-             % On an empty file, don't try to stream.
-             lhttpc:request(URI, Method, Hdrs, [], Timeout);
-        {error, Error} ->
-            {error, Error}
-    end;
+    {ok, State} = lhttpc:request(URI,
+                                 put,
+                                 Hdrs1,
+                                 [],
+                                 Timeout,
+                                 Opts2),
+    stream_file(File, ChunkSize, file:read(File, ChunkSize), State);
 send_req(URI, put, Hdrs, {stream_from, Filename}, Opts) ->
     Body = {stream_from, {Filename, ?DEFAULT_CHUNK_SIZE}},
     send_req(URI, put, Hdrs, Body, Opts);
 send_req(URI, get, Hdrs, Body, [_|_] = Opts) ->
     {Timeout, Opts1} = get_timeout(Opts),
-    case proplists:get_value(stream_to_file, Opts) of
+    case proplists:get_value(stream_to_file, Opts1) of
         undefined ->
             Resp = lhttpc:request(URI, get, Hdrs, Body, Timeout, Opts1),
             wrap_response(Resp);
@@ -53,11 +47,12 @@ send_req(URI, get, Hdrs, Body, [_|_] = Opts) ->
             Opts2 = proplists:delete(stream_to_file, Opts1),
             partial_download(URI, Hdrs, Filename, Timeout, Opts2)
     end;
-send_req(URI, Method, Headers, Body, Opts) ->
+send_req(URI, Method, Hdrs, Body, Opts) ->
     {Timeout, Opts1} = get_timeout(Opts),
-    Resp = lhttpc:request(URI, Method, Headers, Body, Timeout, Opts1),
+    Resp = lhttpc:request(URI, Method, Hdrs, Body, Timeout, Opts1),
     wrap_response(Resp).
 
+%% TODO: Remove the partial download pieces
 -spec partial_download(httpc:url(), headers(), file:filename(), pos_integer(), proplists:proplist()) ->
     mini_s3:response().
 partial_download(URI, Hdrs, Filename, Timeout, Opts) ->
@@ -65,7 +60,13 @@ partial_download(URI, Hdrs, Filename, Timeout, Opts) ->
         true ->
             Opts;
         false ->
-            [{partial_download, []} | Opts]
+            PDOpt = {partial_download,
+                      [
+                       {window_size,1},
+                       {part_size, ?DEFAULT_CHUNK_SIZE}
+                      ]
+                     },
+            [PDOpt | Opts]
     end,
     {ok, File} = file:open(Filename, [write, binary, raw]),
     Resp = lhttpc:request(URI, get, Hdrs, [], Timeout, Opts1),
@@ -121,3 +122,21 @@ wrap_response({ok, {{Code, _Reason}, Hdrs, Payload}}) ->
     {ok, {Code, Hdrs, Payload}};
 wrap_response({error,Reason}) ->
     {error, Reason}.
+
+maybe_add_content_length(Headers, Filename) ->
+    case proplists:is_defined("content-length", Headers) of
+        true ->
+            Headers;
+        false ->
+            FileSize = filelib:file_size(Filename),
+            [{"content-length", integer_to_list(FileSize)} | Headers]
+    end.
+
+maybe_add_flow_control(Options) ->
+    case proplists:is_defined(partial_upload, Options) of
+        true ->
+            Options;
+        false ->
+            [{partial_upload, infinity} | Options]
+    end.
+

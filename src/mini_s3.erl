@@ -62,7 +62,8 @@
 -export([manual_start/0,
          make_authorization/10,
          make_signed_url_authorization/5,
-         service_and_location_to_endpoint/2]).
+         service_and_location_to_endpoint/2,
+         base64_hash_file/3]).
 
 -ifdef(TEST).
 -compile([export_all]).
@@ -148,14 +149,15 @@
 
 -type etag() :: string().
 
--type range() :: {range, Start::integer(), End::integer()}.
+-type range() :: {Start::integer(), End::integer()}.
 
 -type partial_download_opt() :: {partial_download,
                                  [{window_size, infinity | pos_integer()}
                                 | {part_size, pos_integer()}
                                  ]
                                 }.
--type stream_to_file_opt() :: {stream_to_file, file:filename()}.
+-type stream_to_file_opt() :: {stream_to_file, file:filename()}
+                            | {stream_to_file,{file:filename(), pos_integer()}}.
 
 -type get_object_option() :: {range, range() | string()}
                            | {if_modified_since, datetime()}
@@ -165,8 +167,6 @@
                            | {version_id, string()}
                            | stream_to_file_opt()
                            | partial_download_opt()
-                           | {window_size, infinity | pos_integer()}
-                           | {part_size, pos_integer()}
                            | lhttpc_opt().
 
 -type get_object_options() :: [get_object_option()].
@@ -226,8 +226,14 @@
                     | {proxy, httpc:url()}
                     | {proxy_ssl_options, [ssl:ssloption()]}.
 
+-record(chunk_state, {filename = ""                    :: string(),
+                      file                             :: file:file()|undefined,
+                      position = 0                     :: non_neg_integer(),
+                      chunk_size = ?DEFAULT_CHUNK_SIZE :: pos_integer()}).
+
 %% This is a helper function that exists to make development just a
 %% wee bit easier
+%% TODO: move this to CT tests
 -spec manual_start() -> ok.
 manual_start() ->
     ok = application:start(asn1),
@@ -657,49 +663,81 @@ get_object(BucketName, Key, Options) ->
 
 -spec get_object(string(), string(), get_object_options(), config()) ->
                         proplists:proplist().
-get_object(BucketName, Key, Opts, Config) ->
-    Hdrs = [{"Range", get_value(range, Opts)},
-            {"If-Modified-Since", get_value(if_modified_since, Opts)},
-            {"If-Unmodified-Since", get_value(if_unmodified_since, Opts)},
-            {"If-Match", get_value(if_match, Opts)},
-            {"If-None-Match", get_value(if_none_match, Opts)}],
+get_object(Bucket, Key, Opts, Config) ->
+    {Hdrs, Opts1} = opts_to_headers(Opts, [], []),
     Sub = case get_value(version_id, Opts) of
               undefined -> "";
               Version   -> ["versionId=", Version]
     end,
-    Resp = s3_request(Config,get,BucketName,[$/|Key],Sub,[],[],Hdrs,Opts),
-    {RespHdrs, Content} = Resp,
-    ResponseTuple = case get_value(filename, Opts) of
-              undefined -> {content, Content};
-              Filename   -> {filename, Filename}
-    end,
-    extract_metadata(RespHdrs) ++
-    [ResponseTuple,
-     {etag, get_value("etag", RespHdrs)},
-     {content_length, get_value("content-length", RespHdrs)},
-     {content_type, get_value("content-type", RespHdrs)},
-     {delete_marker, is_delete_marker(RespHdrs)},
-     {version_id, get_value("x-amz-version-id", RespHdrs, "null")}
-    ].
+    case get_value(stream_to_file, Opts) of 
+        undefined ->
+            R = s3_request(Config,get,Bucket,[$/|Key],Sub,[],[],Hdrs,Opts1),
+            {RespHdrs, Content} = R,
+            [{content, Content} | response_hdrs_to_proplist(RespHdrs, [])];
+        {Filename, ChnkSz} ->
+            get_chunks(Config, Bucket, Key, Sub, Hdrs, Opts1, Filename, ChnkSz);
+        Filename ->
+            ChnkSz = ?DEFAULT_CHUNK_SIZE,
+            get_chunks(Config, Bucket, Key, Sub, Hdrs, Opts1, Filename, ChnkSz)
+    end.
 
-is_delete_marker(Hdrs) ->
-    case get_value("x-amz-delete-marker", Hdrs) of
-        "true"  -> true;
-        _       -> false
-    end. 
+%% This handles downloading a file in chunks of `ChnkSz` bytes. It uses the
+%% `Byte-Range` header to pull down `ChnkSz` bytes at a time.
+-spec get_chunks(any(),
+                 string(),
+                 string(),
+                 string(),
+                 headers(),
+                 get_object_options(),
+                 file:filename(),
+                 non_neg_integer()) ->
+    proplists:proplist().
+get_chunks(Conf, Bucket, Key, Sub, Hdrs, Opts, Filename, ChnkSz) ->
+    {ok, File} = file:open(Filename, [binary, write, raw]),
+    Opts1 = lists:keydelete(stream_to_file, 1, Opts),
+    State = #chunk_state{filename  = Filename,
+                         file      = File,
+                         position  = 0,
+                         chunk_size = ChnkSz},    
+    get_chunks1(Conf, Bucket, Key, Sub, Hdrs, Opts1, State).
+
+get_chunks1(Config, Bucket, Key, Sub, Hdrs, Opts, State) ->
+    #chunk_state{position=Pos,
+                 chunk_size=ChnkSz,
+                 file=File,
+                 filename=Filename} = State,
+    %% for a 50 byte chunk size, the initial range is 0 - 49 since
+    %% HTTP byte ranges are inclusive
+    Opts1 = lists:keystore(range, 1, Opts, {range, {Pos, Pos + ChnkSz - 1}}),
+    Result = get_object(Bucket, Key, Opts1, Config),
+    Content = get_value(content, Result),
+    ok = file:write(File, Content),
+    CL = list_to_integer(get_value(content_length, Result)),
+    case CL =< ChnkSz of
+        true ->
+            ok = file:close(File),
+            make_chunk_result(Result, Filename);
+        false ->
+            State1 = State#chunk_state{position = Pos + ChnkSz},
+            get_chunks1(Config, Bucket, Key, Sub, Hdrs, Opts, State1)
+    end.
+
+-spec make_chunk_result(proplists:proplist(), file:filename()) ->
+    proplists:proplist().
+make_chunk_result(Result, Filename) ->
+    Result1 = lists:keydelete(content, 1, Result),
+    [{filename, Filename} | Result1].
 
 -spec get_object_acl(string(), string()) -> proplists:proplist().
 get_object_acl(BucketName, Key) ->
     get_object_acl(BucketName, Key, default_config()).
 
--spec get_object_acl(string(), string(), get_object_acl_options() | config()) -> proplists:proplist().
-
-get_object_acl(BucketName, Key, Config)
-  when is_record(Config, config) ->
-    get_object_acl(BucketName, Key, [], Config);
-
-get_object_acl(BucketName, Key, Options) ->
-    get_object_acl(BucketName, Key, Options, default_config()).
+-spec get_object_acl(string(), string(), get_object_acl_options() | config()) ->
+    proplists:proplist().
+get_object_acl(BucketName, Key, Options) when is_list(Options)->
+    get_object_acl(BucketName, Key, Options, default_config());
+get_object_acl(BucketName, Key, Config) ->
+    get_object_acl(BucketName, Key, [], Config).
 
 -spec get_object_acl(string(), string(), get_object_acl_options(), config()) -> proplists:proplist().
 get_object_acl(BucketName, Key, Options, Config) ->
@@ -721,29 +759,65 @@ get_object_metadata(BucketName, Key, Options) ->
                           string(),
                           get_object_metadata_options(),
                           config()) -> proplists:proplist().
-get_object_metadata(BucketName, Key, Options, Config) ->
-    RequestHeaders = [{"If-Modified-Since", get_value(if_modified_since, Options)},
-                      {"If-Unmodified-Since", get_value(if_unmodified_since, Options)},
-                      {"If-Match", get_value(if_match, Options)},
-                      {"If-None-Match", get_value(if_none_match, Options)}],
-    Subresource = case get_value(version_id, Options) of
-                      undefined -> "";
-                      Version   -> ["versionId=", Version]
-                  end,
-    {Headers, _Body} = s3_request(Config, head, BucketName, [$/|Key], Subresource, [], [], RequestHeaders),
-    [{last_modified, get_value("last-modified", Headers)},
-     {etag, get_value("etag", Headers)},
-     {content_length, get_value("content-length", Headers)},
-     {content_type, get_value("content-type", Headers)},
-     {delete_marker, list_to_existing_atom(get_value("x-amz-delete-marker", Headers, "false"))},
-     {version_id, get_value("x-amz-version-id", Headers, "false")}|extract_metadata(Headers)].
+get_object_metadata(Bucket, Key, Opts, Conf) ->
+    {Hdrs, Opts1} = opts_to_headers(Opts, [], []), 
+    Sub = case get_value(version_id, Opts) of
+        undefined -> "";
+        Version   -> ["versionId=", Version]
+    end,
+    {Headers,_} = s3_request(Conf,head,Bucket,[$/|Key],Sub,[],[],Hdrs,Opts1),
+    response_hdrs_to_proplist(Headers, []).
+
+response_hdrs_to_proplist([], Acc) ->
+    Acc1 = case lists:keyfind(delete_marker, 1, Acc) of
+        false -> [{delete_marker, false} | Acc];
+        _     -> Acc
+    end,
+    case lists:keyfind(version_id, 1, Acc1) of
+        false -> [{version_id, false} | Acc1];
+        _     -> Acc1
+    end;
+response_hdrs_to_proplist([{"last-modified", Value} |Rest], Acc) ->
+    response_hdrs_to_proplist(Rest, [{last_modified, Value} | Acc]);
+response_hdrs_to_proplist([{"etag", Value} |Rest], Acc) ->
+    response_hdrs_to_proplist(Rest, [{etag, Value} | Acc]);
+response_hdrs_to_proplist([{"content-length", Value} |Rest], Acc) ->
+    response_hdrs_to_proplist(Rest, [{content_length, Value} | Acc]);
+response_hdrs_to_proplist([{"content-type", Value} |Rest], Acc) ->
+    response_hdrs_to_proplist(Rest, [{content_type, Value} | Acc]);
+response_hdrs_to_proplist([{"x-amz-delete-marker", Value} |Rest], Acc) ->
+    Tuple = {delete_marker, list_to_existing_atom(Value)},
+    response_hdrs_to_proplist(Rest, [Tuple | Acc]);
+response_hdrs_to_proplist([{"x-amz-version-id", Value} |Rest], Acc) ->
+    Tuple = {version_id, list_to_existing_atom(Value)},
+    response_hdrs_to_proplist(Rest, [Tuple | Acc]);
+response_hdrs_to_proplist([ {["x-amz-meta-" | Key], Value} |Rest], Acc) ->
+    response_hdrs_to_proplist(Rest, [{Key, Value} | Acc]);
+response_hdrs_to_proplist([_Ignore |Rest], Acc) ->
+    response_hdrs_to_proplist(Rest, Acc).
+
+%% convert a list list of options to a list of headers and 
+%% a list of non-header options
+opts_to_headers([], HdrsAcc, OptsAcc)  ->
+    {HdrsAcc, OptsAcc};
+opts_to_headers([{if_modified_since, Value} | Rest], HdrsAcc, OptsAcc) ->
+    opts_to_headers(Rest, [{"if-modified-since", Value} | HdrsAcc], OptsAcc);
+opts_to_headers([{if_unmodified_since, Value} | Rest], HdrsAcc, OptsAcc) ->
+    opts_to_headers(Rest, [{"if-unmodified-since", Value} | HdrsAcc], OptsAcc) ;
+opts_to_headers([{if_match, Value} | Rest], HdrsAcc, OptsAcc) ->
+    opts_to_headers(Rest, [{"if-match", Value} | HdrsAcc], OptsAcc);
+opts_to_headers([{if_none_match, Value} | Rest], HdrsAcc, OptsAcc) ->
+    opts_to_headers(Rest, [{"if-none-match", Value} | HdrsAcc], OptsAcc);
+opts_to_headers([{range, {Start, Stop}} | Rest], HdrsAcc, OptsAcc) ->
+    Val = "bytes="++integer_to_list(Start)++"-"++integer_to_list(Stop),
+    opts_to_headers(Rest, [{"range", Val} | HdrsAcc], OptsAcc);
+
+opts_to_headers([NotAHeaderOpt | Rest] , HdrsAcc, OptsAcc) ->
+    opts_to_headers(Rest, HdrsAcc, [NotAHeaderOpt | OptsAcc]).
 
 make_metadata_headers(Options) ->
     MetaOpts = get_value(meta, Options, []),
     [{["x-amz-meta-"|string:to_lower(Key)], Value} ||{Key,Value} <- MetaOpts].
-    
-extract_metadata(Headers) ->
-    [{Key, Value} || {["x-amz-meta-"|Key], Value} <- Headers].
 
 -spec get_object_torrent(string(), string()) -> proplists:proplist().
 get_object_torrent(BucketName, Key) ->
@@ -862,7 +936,7 @@ set_bucket_attribute(BucketName, AttributeName, Value) ->
 -spec set_bucket_attribute(string(), settable_bucket_attribute_name(),
                            'bucket_owner' | 'requester' | [any()], config()) -> ok.
 set_bucket_attribute(BucketName, AttributeName, Value, Config)
-  when is_list(BucketName) ->
+    when is_list(BucketName) ->
     {Subresource, XML} =
         case AttributeName of
             acl ->
@@ -997,13 +1071,13 @@ get_credentials(iam, InitialHeaders, _, _) ->
 
 %% @TODO: Use the Options lists to reduce the length of this method
 %%        signature and try to reduce complexity. If not, consider
-%%        using a record to tuple structure.
+%%        using a record or tuple.
 -spec s3_request(config(), method(), string(), string(), string(), list(), post_data(), headers()) -> {headers(), binary()}.
 s3_request(Conf,Method,Host,Path,Subresource,Params,Data,Hdrs) ->
     s3_request(Conf,Method,Host,Path,Subresource,Params,Data,Hdrs,[]).
 
 -spec s3_request(config(), method(), string(), string(), string(), list(), post_data(), headers(), proplists:proplist()) -> {headers(), binary()}.
-s3_request(Conf, Method,Host,Path,Subresource,Params,Data,Hdrs,Opts) ->
+s3_request(Conf,Method,Host,Path,Subresource,Params,Data,Hdrs,Opts) ->
     #config{credentials_store=CredentialsStore,
                 access_key_id=MaybeAccessKey,
             secret_access_key=MaybeSecretKey} = Conf,
@@ -1062,7 +1136,7 @@ send_s3_request(URI, Method, Headers, Body, Opts) ->
             send_req(URI, head, Headers, Opts);
         _ ->
             %% @TODO: I think this is 'put' only. Let's make it explicit
-            send_req(URI, Method, Headers, Body, Opts)
+            send_req(URI, put, Headers, Body, Opts)
     end,
     parse_s3_response(Response).
 
@@ -1150,12 +1224,10 @@ parse_s3_response({ok, {StatusCode, Headers, Body}}) ->
     end.
 
 %% Shorthand for proplists:get_value/2
--spec get_value(any(), list({any(), any()})) -> any() | undefined. 
 get_value(Key, List) ->
     get_value(Key, List, undefined).
     
 %% Shorthand for proplists:get_value/3
--spec get_value(any(), list({any(), any()}), any()) -> any() | undefined. 
 get_value(Key, List, Default) ->
     proplists:get_value(Key, List, Default).
 
@@ -1171,6 +1243,10 @@ send_req(URI, Method, Headers, Opts) ->
 send_req(URI, Method, Headers, Body, Opts) ->
     httpc_impl:send_req(URI, Method, Headers, Body, Opts).
 
+%% TODO: get rid of subresource throughout the codebase. Instead,
+%%       if a version_id is present, simply append:
+%%       "?version_id=" ++ VersionID to Resource
+%%
 -spec make_authorization(AccessKeyId::binary(),
                          SecretKey::binary(),
                          Method::atom(),
