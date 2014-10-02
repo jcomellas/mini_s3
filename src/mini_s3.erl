@@ -906,7 +906,7 @@ put_object(BucketName, Key, Value, Options, HTTPHdrs, Config) ->
     MetaHdrs =  make_metadata_headers(Options),
     Hdrs = lists:flatten([ACLHdrs, FilteredHdrs, MetaHdrs]),
     Data = {Value, ContentType},
-    Resp = s3_request(Config, put, BucketName, [$/|Key], "", [], Data, Hdrs),
+    Resp = s3_request(Config, put, BucketName, [$/|Key], "", [], Data, Hdrs, Options),
     {RespHdrs, _Body} = Resp,
     [{version_id, get_value("x-amz-version-id", RespHdrs, "null")}].
 
