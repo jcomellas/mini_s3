@@ -189,27 +189,27 @@ del_dir_all(Dir) ->
     file:del_dir(Dir).
 
 
-large_file_path(Config) ->
-    filename:join([get_data_dir(Config), "test_files", "big_file.bin"]).
+%% large_file_path(Config) ->
+%%     filename:join([get_data_dir(Config), "test_files", "big_file.bin"]).
 
-generate_large_file(Config, Size) ->
-    FName = large_file_path(Config),
-    case filelib:is_file(FName) andalso (filelib:file_size(FName) > Size) of
-        true ->
-            {ok, FName};
-        false ->
-            ok = filelib:ensure_dir(FName),
-            file:delete(FName),
-            {ok, File} = file:open(FName, [write, raw, binary]),
-            generate_large_file1(FName, File, Size)
-    end.
+%% generate_large_file(Config, Size) ->
+%%     FName = large_file_path(Config),
+%%     case filelib:is_file(FName) andalso (filelib:file_size(FName) > Size) of
+%%         true ->
+%%             {ok, FName};
+%%         false ->
+%%             ok = filelib:ensure_dir(FName),
+%%             file:delete(FName),
+%%             {ok, File} = file:open(FName, [write, raw, binary]),
+%%             generate_large_file1(FName, File, Size)
+%%     end.
 
-generate_large_file1(FName, File, Size) ->
-    Bytes = crypto:rand_bytes(1024 *256),
-    ok = file:write(File, Bytes),
-    case filelib:file_size(FName) > Size of
-        true ->
-            {ok, FName};
-        false ->
-            generate_large_file1(FName, File, Size)
-    end.
+%% generate_large_file1(FName, File, Size) ->
+%%     Bytes = crypto:rand_bytes(1024 *256),
+%%     ok = file:write(File, Bytes),
+%%     case filelib:file_size(FName) > Size of
+%%         true ->
+%%             {ok, FName};
+%%         false ->
+%%             generate_large_file1(FName, File, Size)
+%%     end.
