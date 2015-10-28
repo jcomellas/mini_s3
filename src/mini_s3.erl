@@ -85,7 +85,7 @@
               http_response/0,
               httpc_opts/0]).
 
--opaque config() :: record(config).
+-opaque config() :: #config{}.
 
 -type datetime() :: calendar:date() | calendar:datetime().
 
