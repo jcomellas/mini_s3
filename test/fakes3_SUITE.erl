@@ -121,7 +121,7 @@ is_fakes3_install_global() ->
 
 get_data_dir(Config) ->
     proplists:get_value(data_dir, Config).
-    
+
 local_fakes3_install_dir(Config) ->
     filename:join(get_data_dir(Config), "fakes3") ++ "/".
 
@@ -134,7 +134,7 @@ install_fakes3_local(Config) ->
     Output = os:cmd(Cmd),
     ct:pal("Local install output: ~p~n",[Output]),
     ok.
-    
+
 -spec start_fakes3(global|local, list()) -> {ok,pid()} | ignore | {error,any()}.
 start_fakes3(InstallType, Config) ->
     Root = filename:join(get_data_dir(Config), "fake_s3_root") ++ "/",
@@ -174,7 +174,7 @@ maybe_del_dir_all(Dir) ->
             ok
     end.
 
-del_dir_all(Dir) ->            
+del_dir_all(Dir) ->
     {ok, Filenames0} = file:list_dir_all(Dir),
     Filenames = [filename:join(Dir, F) || F <- Filenames0],
     lists:foreach(fun(Filename)->
